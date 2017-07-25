@@ -1,73 +1,47 @@
-// I2C device class (I2Cdev) demonstration Arduino sketch for MPU6050 class using DMP (MotionApps v2.0)
-// 6/21/2012 by Jeff Rowberg <jeff@rowberg.net>
-// Updates should (hopefully) always be available at https://github.com/jrowberg/i2cdevlib
-//
-// Changelog:
-//      2013-05-08 - added seamless Fastwire support
-//                 - added note about gyro calibration
-//      2012-06-21 - added note about Arduino 1.0.1 + Leonardo compatibility error
-//      2012-06-20 - improved FIFO overflow handling and simplified read process
-//      2012-06-19 - completely rearranged DMP initialization code and simplification
-//      2012-06-13 - pull gyro and accel data from FIFO packet instead of reading directly
-//      2012-06-09 - fix broken FIFO read sequence and change interrupt detection to RISING
-//      2012-06-05 - add gravity-compensated initial reference frame acceleration output
-//                 - add 3D math helper file to DMP6 example sketch
-//                 - add Euler output and Yaw/Pitch/Roll output formats
-//      2012-06-04 - remove accel offset clearing for better results (thanks Sungon Lee)
-//      2012-06-01 - fixed gyro sensitivity to be 2000 deg/sec instead of 250
-//      2012-05-30 - basic DMP initialization working
-
 /* ============================================
-I2Cdev device library code is placed under the MIT license
-Copyright (c) 2012 Jeff Rowberg
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+* Motorcycle Data logger sketch by Gideon Nyaga...
+* giddyeffects@gmail.com
 ===============================================
 */
 
 // I2Cdev and MPU6050 must be installed as libraries, or else the .cpp/.h files
 // for both classes must be in the include path of your project
 #include "I2Cdev.h"
-
+//include time lib
+#include "Time.h"
+//include RTC lib
+#include "DS1307RTC.h"
+//include accelerometer lib
 #include "MPU6050_6Axis_MotionApps20.h"
-//#include "MPU6050.h" // not necessary if using MotionApps include file
 
 // Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation
 // is used in I2Cdev.h
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
     #include "Wire.h"
 #endif
-//include LCD display libary
+//include I2C LCD display libary
 #include <LiquidCrystal_I2C.h>
 LiquidCrystal_I2C lcd(0x27,2,1,0,4,5,6,7,3, POSITIVE);  // Set the LCD I2C address
 
 //welcome message
 char welcomeMsg[] = "--Honda Falcon--";
 
-//define pushbuttons
-const int goRightBtn = 4;  // pushbutton 3 pin
-const int goLeftBtn = 3;  // pushbutton 4 pin
+//define trip meter reset button
+const int resetTripBtn = 5;
+
+const int airTempPin = 3; //using analog pin 3 to measure sensor's input SIGNAL
+
 //define & init screens
-int curScreen = 1;
-int prevScreen = 1;
-int nextScreen = 2;
-int maxScreens = 5;
+int curScreen = 1; //current LCD screen
+int maxScreens = 5; //max screens to be shown
+//define other variables
+int rpm = 0;
+long odometer = 0;
+float tripmeter = 0.00;
+int servicemeter = 0;
+float battVoltage = 0.0;
+float airTemp = 0.0;
+float engineTemp = 0.0;
 
 // class default I2C address is 0x68
 // specific I2C addresses may be passed as a parameter here
@@ -118,7 +92,14 @@ MPU6050 mpu;
 #define INTERRUPT_PIN 2  // use pin 2 on Arduino Uno & most boards
 #define LED_PIN 12 // have changed to 12 for now (Arduino is 13, Teensy is 11, Teensy++ is 6)
 #define BACKLIGHT_PIN 13
-bool blinkState = false;
+#define RPM_LED_PIN 11
+#define BAT_LED_PIN 10
+#define GPS_LED_PIN 9
+//define buttons to operate LCD screen
+#define goRightBtn 4  // pushbutton 3 pin
+#define goLeftBtn 3  // pushbutton 4 pin
+
+bool blinkState = false; //accel LED blinkState
 
 // MPU control/status vars
 bool dmpReady = false;  // set true if DMP init was successful
@@ -128,6 +109,7 @@ uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
 uint16_t fifoCount;     // count of all bytes currently in FIFO
 uint8_t fifoBuffer[64]; // FIFO storage buffer
 
+//@TODO remove variables that won't be used in production data logger
 // orientation/motion vars
 Quaternion q;           // [w, x, y, z]         quaternion container
 VectorInt16 aa;         // [x, y, z]            accel sensor measurements
@@ -161,15 +143,16 @@ void setup() {
     #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
         Fastwire::setup(400, true);
     #endif
-//LCD stuff
+  //LCD stuff
   //set pushbuttons to be inputs
+  pinMode(resetTripBtn, INPUT);
   pinMode(goLeftBtn, INPUT);
   pinMode(goRightBtn, INPUT);
-  
-  // Switch on the backlight
+
+  // Switch on the LCD backlight @TODO can add a pushbutton later on
   pinMode ( BACKLIGHT_PIN, OUTPUT );
   digitalWrite ( BACKLIGHT_PIN, HIGH );
-  
+
   lcd.begin(16,2);               // initialize the lcd
   lcd.clear();                   //clear screen initially
   lcd.home ();                   // go home
@@ -212,17 +195,58 @@ void setup() {
         // 1 = initial memory load failed
         // 2 = DMP configuration updates failed
         // (if it's going to break, usually the code will be 1)
-        
+
         //Serial.print(F("DMP Initialization failed (code "));
         //Serial.print(devStatus);
         //Serial.println(F(")"));
     }
 
-    // configure LED for output
+    // configure LEDs for output
     pinMode(LED_PIN, OUTPUT);
+    pinMode(RPM_LED_PIN, OUTPUT);
+    pinMode(BAT_LED_PIN, OUTPUT);
+    pinMode(GPS_LED_PIN, OUTPUT);
+}
+//-----get temp in degrees Celsius-----
+float getTemp(int pin){
+  float temp;
+  temp = analogRead(pin)*5/1024.0;//max output arduino can read is 5V and ADC is 10bit add .0 to make it float
+  temp = temp - 0.4;//0 degC is 0.4V
+  temp = temp / 0.01953;//for MCP9701A 0.01953V per degC
+  return temp;
+}
+//----process screen stuff----
+void processScreens(){
+  //my stuff about screens here
+  int rightButtonState = digitalRead(goRightBtn);
+  if (rightButtonState == LOW){ //go to screen on the right
+    delay(500);//to allow switch debounce
+    curScreen = curScreen + 1;
+    if(curScreen > maxScreens){//reset screens when max is reached
+      curScreen = 1;
+    }
+  }
+
+  int leftButtonState = digitalRead(goLeftBtn);
+  if (leftButtonState == LOW ){ //go to screen on the left
+    delay(500);
+    curScreen = curScreen - 1;
+    if (curScreen < 1){
+      curScreen = maxScreens;
+    }
+  }
 }
 
-
+void processTripReset(){
+  int tripResetState = digitalRead(resetTripBtn);
+  if (tripResetState == LOW){
+    delay(1200);
+    tripResetState = digitalRead(resetTripBtn);
+    if(tripResetState == LOW){
+      tripmeter = 0.0;
+    }
+  }
+}
 
 // ================================================================
 // ===                    MAIN PROGRAM LOOP                     ===
@@ -266,7 +290,7 @@ void loop() {
 
         // read a packet from FIFO
         mpu.getFIFOBytes(fifoBuffer, packetSize);
-        
+
         // track FIFO count here in case there is > 1 packet available
         // (this lets us immediately read more without waiting for an interrupt)
         fifoCount -= packetSize;
@@ -343,42 +367,54 @@ void loop() {
         blinkState = !blinkState;
         digitalWrite(LED_PIN, blinkState);
     }
-    //my stuff about screens here
-    int rightButtonState = digitalRead(goRightBtn);
-    if (rightButtonState == LOW){
-      delay(500);
-        prevScreen = curScreen;
-        curScreen = curScreen + 1;
-        nextScreen = curScreen + 1;
-        if(curScreen > maxScreens){//reset screens when max is reached
-          curScreen = 1;
-          prevScreen = 1;
-          nextScreen = 2;
-        }
-    }
-  //show relevant info the the different screens
+    //get air temperature
+    airTemp = getTemp(airTempPin);
+    processTripReset();
+    
+    processScreens();
+    //show relevant info the different screens
     switch (curScreen) {
         case 1: {
           lcd.home ();                   // go home
           lcd.clear();                   //clear screen
-          lcd.print("O:999999");
-          lcd.print(" 9999rpm");  
+          lcd.print("O:");
+          lcd.print(odometer);
+          lcd.print(" ");
+          lcd.print(rpm);
+          lcd.print("rpm");
           lcd.setCursor ( 0, 1 );        // go to the next line
-          lcd.print ("A:999KM");
+          lcd.print ("A:");
+          lcd.print(tripmeter);
           lcd.print(" 999km/h");
           break;
         }
-          
+
         case 2: {
           lcd.home ();                   // go home
           lcd.clear();                   //clear screen
-          lcd.print("TIME:12:59HRS");
+          lcd.print("AT:");//air Temp
+          lcd.print(airTemp);
+          lcd.print("C ");
+          lcd.print("ET:");//engine Temp
+          lcd.print(engineTemp);
+          lcd.print("C");
           lcd.setCursor ( 0, 1 );        // go to the next line
-          lcd.print ("DATE: 31/12/2017");
+          lcd.print ("BAT:");
+          lcd.print(battVoltage);
+          lcd.print("V 12:59H");
           break;
         }
-          
-         case 3: {
+
+        case 3: {
+          lcd.home ();                   // go home
+          lcd.clear();                   //clear screen
+          lcd.print("LAT:");
+          lcd.setCursor ( 0, 1 );        // go to the next line
+          lcd.print ("LONG:");
+          break;
+        }
+
+         case 4: {
           lcd.clear();
           lcd.home();
           lcd.print("Y:");
@@ -390,5 +426,10 @@ void loop() {
           lcd.print(ypr[2] * 180/M_PI);
           break;
          }
+        case 5: {
+          lcd.clear();
+          lcd.home();
+          break;
+        }
     }
 }
