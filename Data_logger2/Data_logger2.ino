@@ -11,6 +11,7 @@
 #include "I2Cdev.h"
 //include time lib
 #include "Time.h"
+#undef DAYS_PER_WEEK 
 //include RealTimeClock/RTC lib
 #include "DS1307RTC.h"
 //load the elasped library
@@ -19,12 +20,21 @@
 #include "Wire.h"
 //include I2C LCD display libary
 #include <LiquidCrystal_I2C.h>
+//include NEOGPS library
+#include <NMEAGPS.h>
+//include the GPSPort library
+#include <GPSport.h>
 
 //==========VARIABLES==========
 //Init LCD
 LiquidCrystal_I2C lcd(0x3F, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE); //=> addr, EN, RW, RS, D4, D5, D6, D7, BacklightPin, POLARITY... Set the LCD I2C address 20x04 screen
 //Create an elapsedMillis Instance
 elapsedMillis timeElapsed;
+//create GPS variable
+NMEAGPS gps; //this parses the GPS characters
+gps_fix fix; //this holds on to the latest values
+bool cansettime = true;
+double gps_lat = 0.00, gps_long = 0.00;
 //welcome message
 char welcomeMsg[] = "HONDA", welcomeMsg2[] = "FALCON";
 // RTC non-volatile storage
@@ -40,10 +50,11 @@ char welcomeMsg[] = "HONDA", welcomeMsg2[] = "FALCON";
 #define INTERRUPT_PIN 2      // use pin 2 on Arduino Uno & most boards
 #define HALL_INTERRUPT_PIN 3 //also pin 3 can be used as interrupt
 #define LED_PIN 13           //(Arduino is 13, Teensy is 11, Teensy++ is 6)
+#define GPS_LED_PIN 12
 #define RPM_LED_PIN 11
 #define BAT_LED_PIN 10
-#define GPS_LED_PIN 9
-#define SERVICE_LED_PIN 8
+//pins 9 and 8 used for the software serial
+#define SERVICE_LED_PIN 7
 #define BATTERY_PIN A2 //use analog pin2 to read motorbike battery voltage
 //define trip meter reset button
 #define resetTripBtn 6
@@ -51,6 +62,7 @@ char welcomeMsg[] = "HONDA", welcomeMsg2[] = "FALCON";
 #define backlightBtn 5 // pushbutton 5 pin
 #define goRightBtn 4   // pushbutton 4 pin
 #define tempPin A3  //using analog pin 3 to measure temp sensor's input SIGNAL
+
 
 //values to store in NVRAM
 float f_TripA = 0.0, f_Service = 0.0, f_ODO = 0.0;
@@ -241,7 +253,8 @@ void setup() {
   Wire.begin(); //start the wire :)
   Wire.setClock(400000); // 400kHz I2C clock. Comment this line if having compilation difficulties
   setupMPU();
-
+  //setup GPS
+  gpsPort.begin(9600);
 }
 // ********************************************************************************** //
 //                                      SUBROUTINES
@@ -249,7 +262,7 @@ void setup() {
 
 void setupMPU() {
   //=========MPU stuff=========
-  Serial.begin(115200);
+  Serial.begin(9600);
 
   Wire.beginTransmission(MPU);
   Wire.write(0x6B);
@@ -274,7 +287,7 @@ void readMPU() {
   gy = Wire.read() << 8 | Wire.read();      //0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
   gz = Wire.read() << 8 | Wire.read();      //0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
 
-  Serial.println("Raw Values");
+  /*Serial.println("Raw Values");
   Serial.println("==========");
   Serial.print("ax/ay/az/gx/gy/gz/airTempMPU\t");
   Serial.print(ax);
@@ -290,7 +303,7 @@ void readMPU() {
   Serial.print(gz);
   Serial.print("\t");
   Serial.print(airTempMPU / 340 + 36.53);
-  Serial.println();
+  Serial.println();*/
 
   accXangle = (atan2(ay, az) * RAD_TO_DEG);
   accYangle = (atan2(ax, az) * RAD_TO_DEG);
@@ -316,11 +329,11 @@ void readMPU() {
     //Roll & Pitch Equations
     roll  = (atan2(-fYg, fZg)*180.0)/M_PI;
     pitch = (atan2(fXg, sqrt(fYg*fYg + fZg*fZg))*180.0)/M_PI; */
-  Serial.print(yaw);
+  /*Serial.print(yaw);
   Serial.print(":");
   Serial.print(pitch);
   Serial.print(":");
-  Serial.println(roll);
+  Serial.println(roll);*/
   delay(100);
 }
 
@@ -509,6 +522,7 @@ void showTime() {
   }
   else {
     if (RTC.chipPresent()) {
+      //set time from the GPS
       lcd.print("setTime");
     }
     else {
@@ -589,13 +603,50 @@ void RTC_WriteFloat(int valAddr, float value) {
   }
 }
 
+// ================================================================
+// ===                    GPS FUNCTIONS                    ===
+// ================================================================
+void getGPS() {
+  while (gps.available( gpsPort )) {
+    fix = gps.read();
+    //@TODO confirm if this is the right check!!! or is it fix.valid.status??
+    if(fix.valid.location){
+      //if gps location locked..turn on GPS LED
+      digitalWrite(GPS_LED_PIN, HIGH);
+      gps_lat = fix.latitude();
+      gps_long = fix.longitude();
+      DEBUG_PORT.print(fix.latitude(), 6);
+      DEBUG_PORT.print(',');
+      DEBUG_PORT.print(fix.longitude(), 6);
+      DEBUG_PORT.println();
+    }
+    else {
+      gps_lat = 0.00;
+      gps_long = 0.00;
+      DEBUG_PORT.println("No location fix yet");
+      digitalWrite(GPS_LED_PIN, LOW);
+    }
+    //
+    if(fix.valid.speed){
+      DEBUG_PORT.print("Speed(kph):");
+      DEBUG_PORT.println(fix.speed_kph());
+    }
+    if(fix.valid.time && cansettime) {
+      cansettime = false;//set time only once
+
+    }
+    
+    //digitalWrite(GPS_LED_PIN, !digitalRead(GPS_LED_PIN)); // toggle the GPS_LED_PIN
+  }
+}
+
 
 // ================================================================
 // ===                    MAIN PROGRAM LOOP                     ===
 // ================================================================
 void loop() {
   //get air temperature
-  engineTemp = getTemp(tempPin);
+  engineTemp = getTemp(tempPin);//using the temp sensor
   //check and process backlight button
   processBacklightBtn();
   //check and process trip reset button
@@ -648,7 +699,7 @@ void loop() {
       lcd.home(); // go home
       //lcd.clear();                   //clear screen
       lcd.print("AirTemp:"); //air Temp
-      lcd.print(airTempMPU);
+      lcd.print(airTempMPU / 340 + 36.53);//air temp accg to the MPU
       lcd.print((char)223); //degree sign
       lcd.print("C TRIP");
       lcd.setCursor(0, 1);   // go to the next line
@@ -658,10 +709,12 @@ void loop() {
       lcd.print("C  B");
       lcd.setCursor(0, 2); // go to the next line
       lcd.print("LAT:");
+      lcd.print(gps_lat,5);//print the latitude
       lcd.setCursor(15, 2);
       lcd.print(":9999");
       lcd.setCursor(0, 3); // go to the next line
       lcd.print("LONG:");
+      lcd.print(gps_long,5);//print the longitude
       break;
     }
 
@@ -681,7 +734,8 @@ void loop() {
       break;
     }
   }
-  readMPU(); 
+  readMPU();
+  getGPS();
 }
 // ********************************************************************************** //
 //                                      OPERATION ROUTINES

@@ -1,0 +1,6 @@
+{
+    "board": "arduino:avr:uno",
+    "port": "COM5",
+    "programmer": "Arduino Gemma",
+    "sketch": "Data_logger2\\Data_logger2.ino"
+}

@@ -25,7 +25,7 @@ elapsedMillis timeElapsed;//Create an Instance
 //include I2C LCD display libary
 #include <LiquidCrystal_I2C.h>
 //LiquidCrystal_I2C lcd(0x27,2,1,0,4,5,6,7,3, POSITIVE);  // Set the LCD I2C address 16x02 screen
-LiquidCrystal_I2C lcd(0x3F,2,1,0,4,5,6,7,3, POSITIVE);  // Set the LCD I2C address 20x04 screen
+LiquidCrystal_I2C lcd(0x3F,2,1,0,4,5,6,7,3, POSITIVE);  //=> addr, EN, RW, RS, D4, D5, D6, D7, BacklightPin, POLARITY... Set the LCD I2C address 20x04 screen
 
 //welcome message
 char welcomeMsg[] = "HONDA";
@@ -34,7 +34,7 @@ char welcomeMsg2[] = "FALCON";
 #define RTC_I2C_ADDR  0x68         // Real time clock address on the I2C bus
 #define RAM_ADDR      8            // RTC RAM registers start at address 8
 #define TRIPA_ADDR    RAM_ADDR     // Trips, ODO, lat and long are all floats, 4 bytes ea.     
-#define SERVICE_ADDR    TRIPA_ADDR + 4    //@TODO can change this to service distance
+#define SERVICE_ADDR    TRIPA_ADDR + 4    //@TODO can change this to tripmeter B
 #define ODO_ADDR      SERVICE_ADDR + 4
 //#define LAT_ADDR      ODO_ADDR + 4 //tobe activated once i get GPS chip
 //#define LON_ADDR      LAT_ADDR + 4 //
@@ -58,36 +58,26 @@ long odometer = 0L; //odometer internal: 0 to 999,999
 float tripmeterA = 0.0; //tripmeter internal: 0 to 999
 float servicemeter = 0.0; //distance since last service...
 String bigKPH;
-// wheel radius in mm * 100 * 2 * ( pi * 10000 ) = 94.248000 mm perimeter.
-// 6 0's were used in scaling up radius and pi, 6 places are divided in the end
-// and the units work out. You can use integers more accurate than float on
-// Arduino at greatly faster speed. Both type of long can hold any 9-digits.
-// Arduino variable type long long can hold any 19 digits is 19 place accuracy.
-// if you work in Small Units and scale back later, integers are plenty accurate.
-// remember, this value has to be divided by microseconds per turn.
-const unsigned long wheel_perimeter = 1500UL * 2UL * 31416UL; // = 94,248,000 //radius * 2 * pi, 'UL' to force the constant into an unsigned long constant
-// wheel perimeter gets divided by microseconds, 1,000,000/sec (usec or us).
-// wheel turns once for 94248000 mm/100 in 1000000 usecs = 
-//wheel radius is 15mm
+int rotationcounter=0;
 
-unsigned long Speed = 0;
-unsigned long PrevSpeed = 0;
+int vspeed=0;
+int dvspeed=0; 
+int tyrec=1935;//tyre circumference in ?? 
+long deltat=0; 
+long timea=0; 
+long timec=0;
 
-volatile byte hall_rising = 0; // interrupt flag
-volatile unsigned long irqMicros;
-
-unsigned long startMicros;
-unsigned long differenceTimeMicros;
-
-unsigned long hallEffectCount = 0;
-unsigned long distance = 0;
+int speedrr=500; 
+const int speedarraysize=5;  
+int speedarray[speedarraysize];
+int arrayposition=0;
 //--------------------------------------------------------------------------------------------
 
 //----------- Battery Voltage variables ------------------------------------------------------
 // number of analog samples to take per reading
 #define NUM_SAMPLES 10
 float battVoltage = 0.0; //calculated voltage
-int vsum = 0; //sum of samples taken
+int vsum = 0; //voltage sum of samples taken
 unsigned char sample_count = 0; // current sample number
 //--------------------------------------------------------------------------------------------
 int tempWhole, tempFract;
@@ -140,19 +130,21 @@ MPU6050 mpu(0x69); // <-- use for AD0 high using 0x69 coz of RTC which is on 0x6
 
 #define INTERRUPT_PIN 2  // use pin 2 on Arduino Uno & most boards
 #define HALL_INTERRUPT_PIN 3 //also pin 3 can be used as interrupt
-#define LED_PIN 12 // have changed to 12 for now (Arduino is 13, Teensy is 11, Teensy++ is 6)
-#define BACKLIGHT_PIN 13
+#define LED_PIN 13 //(Arduino is 13, Teensy is 11, Teensy++ is 6)
 #define RPM_LED_PIN 11
 #define BAT_LED_PIN 10
 #define GPS_LED_PIN 9
-#define BATTERY_PIN A0
+#define SERVICE_LED_PIN 8
+#define BATTERY_PIN A2 //use analog pin2 to read motorbike battery voltage
 
 //define trip meter reset button
 #define resetTripBtn 6
 //define buttons to operate LCD screen
-#define goRightBtn 5  // pushbutton 3 pin
-#define goLeftBtn 4  // pushbutton 4 pin
+#define backlightBtn 5  // pushbutton 5 pin
+#define goRightBtn 4  // pushbutton 4 pin
 #define airTempPin A3 //using analog pin 3 to measure sensor's input SIGNAL
+
+bool backlightState = true;
 
 bool blinkState = false; //accel LED blinkState
 
@@ -188,9 +180,10 @@ void dmpDataReady() {
 //volatile bool hallInterrupt = false; //indicates whether HALL interrupt pin has gone low??
 //my interrupt detection for hall sensor
 void magnetDetect(){//called whenever a magnet/interrupt is detected by the hall sensor
-  irqMicros = micros();
-  hall_rising = 1;
-  hallEffectCount++;
+  vspeed=tyrec*3.6/(millis()-deltat);
+  timea=millis();
+  deltat=millis();
+  rotationcounter=rotationcounter+1;
 }
 
 // ================================================================
@@ -290,12 +283,8 @@ void setup() {
     //LCD stuff
     //set pushbuttons to be inputs
     pinMode(resetTripBtn, INPUT);
-    pinMode(goLeftBtn, INPUT);
+    pinMode(backlightBtn, INPUT);
     pinMode(goRightBtn, INPUT);
-
-    // Switch on the LCD backlight @TODO can add a pushbutton later on
-    pinMode ( BACKLIGHT_PIN, OUTPUT );
-    digitalWrite ( BACKLIGHT_PIN, HIGH );
 
     //lcd.begin(16,2);               // initialize the lcd for 16x02
     lcd.begin(20,4);               // initialize the lcd for 20x04
@@ -312,7 +301,7 @@ void setup() {
     mpu.initialize();
     pinMode(INTERRUPT_PIN, INPUT);
     pinMode(HALL_INTERRUPT_PIN, INPUT);
-    Serial.begin(9600);//@TODO remove later on
+    //Serial.begin(9600);//@TODO remove later on
     
     // the function to get the time from the RTC
     setSyncProvider(RTC.get);
@@ -379,6 +368,7 @@ void setup() {
     pinMode(RPM_LED_PIN, OUTPUT);
     pinMode(BAT_LED_PIN, OUTPUT);
     pinMode(GPS_LED_PIN, OUTPUT);
+    pinMode(SERVICE_LED_PIN, OUTPUT);
 }
 
 
@@ -443,19 +433,31 @@ void processScreens(){
     }
   }
 
-  int leftButtonState = digitalRead(goLeftBtn);
-  if (leftButtonState == LOW ){ //go to screen on the left
-    lcd.clear(); //clear screen only if changing the screen
-    if(timeElapsed > 500) {
-      curScreen = curScreen - 1;
-      if (curScreen < 1){
-        curScreen = maxScreens;
-      }
-      timeElapsed = 0;
-    }
-  }
+//@NOTE: not using a left button for now..changed it to backlight button
+//  int leftButtonState = digitalRead(goLeftBtn);
+//  if (leftButtonState == LOW ){ //go to screen on the left
+//    lcd.clear(); //clear screen only if changing the screen
+//    if(timeElapsed > 500) {
+//      curScreen = curScreen - 1;
+//      if (curScreen < 1){
+//        curScreen = maxScreens;
+//      }
+//      timeElapsed = 0;
+//    }
+//  }
 }
 
+void processBacklightBtn(){
+ int bbtnState = digitalRead(backlightBtn);
+ if (bbtnState == LOW ) {
+  if(timeElapsed > 500) { //allow for switch debounce check if this is necessary...
+    //toggle backlight
+    backlightState = !backlightState;
+    lcd.setBacklight(backlightState);
+    timeElapsed = 0;
+  }
+ }
+}
 void processTripReset(){
   int tripResetState = digitalRead(resetTripBtn);
   if (tripResetState == LOW){
@@ -464,7 +466,9 @@ void processTripReset(){
       delay(1200);
       tripResetState = digitalRead(resetTripBtn);
       if(tripResetState == LOW){ //@TODO reset service after holding button for say 10 seconds
-        tripmeterA = 0.0;
+        f_TripA = 0.0;
+        tripmeterA = f_TripA;
+        RTC_WriteFloat( TRIPA_ADDR, f_TripA );
       }
     //}
   }
@@ -479,7 +483,7 @@ void processVoltage(){
   // calculate the voltage
   // use 5.0 for a 5.0V ADC reference voltage
   // 5.015V is the calibrated reference voltage
-  battVoltage = ((float)sum / (float)NUM_SAMPLES * 5.015) / 1024.0;
+  battVoltage = ((float)vsum / (float)NUM_SAMPLES * 5.015) / 1024.0;
   // send voltage for display on Serial Monitor
   // voltage multiplied by 11 when using voltage divider that
   // divides by 11. 11.132 is the calibrated voltage divide
@@ -488,44 +492,53 @@ void processVoltage(){
   vsum = 0;
 }
 void processSpeed() {
-//  hallState = digitalRead(HALL_INTERRUPT_PIN);
-//  if (hallState == LOW) {
-//    revs = revs + 1;
-//  }
-while(hall_rising == 1){
-      differenceTimeMicros = irqMicros - startMicros;
-      startMicros = irqMicros;
-      hall_rising = 0;
-    }
+  if (millis()-timea > 1000){
+    vspeed=0;
+    timea=millis();
+  }
   
-    distance = (wheel_perimeter * hallEffectCount)/1000000000; //distance in meters
-    if( differenceTimeMicros != 0 ){
-      Speed =  wheel_perimeter / differenceTimeMicros; //speed = distance / time
-      Speed = (Speed*3600)/1000000; // this converts the speed from mm/s to Km/h
+  if (millis()-timec >= speedrr/speedarraysize){ 
+    speedarray[arrayposition]=vspeed;
+    arrayposition=arrayposition+1;
+  
+    if (arrayposition == speedarraysize){
+      arrayposition=0;
+      dvspeed=0;
       
-      if ( Speed != PrevSpeed )
+      for (int x=0; x<speedarraysize; x++)
       {
-        Serial.print( distance );
-        Serial.println( "mm  " );
-        //Serial.println( differenceMicros ); // this now shows mm/sec with no remainder
-        Serial.print( Speed ); // this converts the speed from mm/s to Km/h
-        //Serial.print( "mm/s  alt=" );
-        Serial.print( "KM/H  " );
-        Serial.println( " " );
-  
-        
+        dvspeed=dvspeed+speedarray[x];
       }
-    
-    }else {
-      Speed = 0;
-      Serial.print( Speed ); 
-      //Serial.print( "mm/s  alt=" );
-      Serial.println( "KM/H  " );
+      
+      /*
+       * The following line calculates the speed in km/h.
+       * If you want the speed in MPH change it into this:
+       * dvspeed=(dvspeed/speedarraysize)*0.621371192;
+       */
+      dvspeed=dvspeed/speedarraysize;  
+      
     }
+    timec=millis();
+  }
+  
+  //actions after driving 1km @TODO change to every 100m for tripmeter
+  if (rotationcounter >= 1000000/tyrec){
+    f_ODO = f_ODO + 1;
+    f_TripA = f_TripA + 1;
+    f_Service = f_Service + 1;
+    odometer= f_ODO;
+    tripmeterA= f_TripA;
+    servicemeter = f_Service;
     
-    
-
-    PrevSpeed = Speed;
+    if (tripmeterA > 999){
+      tripmeterA=0;
+    } 
+    // Save trip, ODO and Service floats to RTC storage
+    RTC_WriteFloat( TRIPA_ADDR, f_TripA );
+    RTC_WriteFloat( ODO_ADDR, f_ODO );
+    RTC_WriteFloat( SERVICE_ADDR, f_Service );
+    rotationcounter=0;
+  }
 }
 
 void print2digits(int number) {
@@ -554,7 +567,7 @@ void showTime(){
 //**************************
 // RTC DS1307
 // NVRAM register access functions
-//
+//**************************
 
 // Reads a 2-byte integer value from the RTC RAM registers
 int RTC_ReadInteger( int valAddr )
@@ -655,7 +668,7 @@ void loop() {
     mpuIntStatus = mpu.getIntStatus();
 
     // get current FIFO count
-    fifoCount = mpu.getFIFOCount();
+    fifoCount = mpu.getFIFOCount();//@TODO the library has a bug here..can opt not to use this function
 
     // check for overflow (this should never happen unless our code is too inefficient)
     if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
@@ -749,7 +762,11 @@ void loop() {
     }
     //get air temperature
     airTemp = getTemp(airTempPin);
+    //check and process backlight button
+    processBacklightBtn();
+    //check and process trip reset button
     processTripReset();
+    //calculate speed
     processSpeed();
     /*while(!hallInterrupt){
       tripmeterA = tripmeterA + 1;
@@ -763,8 +780,8 @@ void loop() {
           lcd.home ();                   // go home
           //lcd.clear();                   //clear screen
           //writeBigString(revs, 0, 0);
-          if(Speed < 10){ bigKPH = "00"; bigKPH += Speed ; }
-          if (Speed >= 10 && Speed < 100){  bigKPH = "0"; bigKPH += Speed ; }
+          if(dvspeed < 10){ bigKPH = "00"; bigKPH += dvspeed ; }
+          if (dvspeed >= 10 && dvspeed < 100){  bigKPH = "0"; bigKPH += dvspeed ; }
           char c[bigKPH.length()+1]; bigKPH.toCharArray(c, bigKPH.length()+1);
           writeBigString(c, 0, 0);
           lcd.print("kmph");
@@ -784,9 +801,9 @@ void loop() {
           lcd.print(odometer);
           //lcd.print("999999");
           lcd.print(" ");
-          lcd.print ("TripA:");
-          //lcd.print(tripmeterA);
-          lcd.print("999");
+          lcd.print ("TRP:");
+          lcd.print(tripmeterA);
+          //lcd.print("999.9");
           break;
         }
 
